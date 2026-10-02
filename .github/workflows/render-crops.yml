@@ -1,0 +1,89 @@
+name: 渲染解析裁切图（原格式 JPEG）
+
+# 从 zz-pdf 里的《解析册》分卷重新渲染并裁切，直接产出 JPEG 原格式（不转 WebP）。
+# 全程在 GitHub 服务器上跑，手机零流量。
+
+on:
+  workflow_dispatch:
+    inputs:
+      dpi:
+        description: '渲染 DPI'
+        required: false
+        default: '270'
+      quality:
+        description: 'JPEG 质量'
+        required: false
+        default: '95'
+
+concurrency:
+  group: render-crops
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装工具
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+          python3 -m pip install --quiet --disable-pip-version-check pillow
+
+      - name: 下载并合并《解析册》分卷
+        run: |
+          set -e
+          mkdir -p /tmp/src && cd /tmp/src
+          for i in $(seq 1 20 441); do
+            s=$(printf '%03d' $i); e=$(printf '%03d' $((i+19)))
+            curl -sSfL -o "v_${s}.pdf" \
+              "https://raw.githubusercontent.com/aokid666/zz-pdf/main/pdf/%E8%A7%A3%E6%9E%90%E5%86%8C-P${s}-${e}.pdf"
+          done
+          ls -1 | wc -l
+          pdfunite v_*.pdf /tmp/full.pdf
+          pdfinfo /tmp/full.pdf | grep -E '^Pages|^Page size'
+
+      - name: 渲染页面（4 路并行）
+        run: |
+          set -e
+          mkdir -p /tmp/pg
+          n=$(pdfinfo /tmp/full.pdf | awk '/^Pages/{print $2}')
+          step=$(( (n + 3) / 4 ))
+          for k in 0 1 2 3; do
+            f=$(( k * step + 1 )); l=$(( (k + 1) * step ))
+            [ $l -gt $n ] && l=$n
+            [ $f -gt $n ] && continue
+            pdftoppm -jpeg -r ${{ inputs.dpi }} -jpegopt quality=95 \
+                     -f $f -l $l /tmp/full.pdf /tmp/pg/p &
+          done
+          wait
+          echo "渲染完成：$(ls /tmp/pg | wc -l) 页，$(du -sh /tmp/pg | cut -f1)"
+
+      - name: 裁切（输出 JPEG，不转码）
+        env:
+          DPI: ${{ inputs.dpi }}
+          JPEG_Q: ${{ inputs.quality }}
+        run: python3 scripts/crop.py
+
+      - name: 分批提交推送
+        run: |
+          set -e
+          git config user.name  github-actions
+          git config user.email actions@github.com
+          ls img/ac/*.jpg > /tmp/list.txt
+          echo "共 $(wc -l < /tmp/list.txt) 张"
+          split -l 250 /tmp/list.txt /tmp/chunk_
+          b=0
+          for c in /tmp/chunk_*; do
+            b=$((b + 1))
+            xargs -a "$c" git add
+            if git diff --cached --quiet; then continue; fi
+            git commit -q -m "解析裁切图 JPEG 第 $b 批"
+            git push -q
+            echo "  第 $b 批已推送"
+          done
+          echo "全部完成"
